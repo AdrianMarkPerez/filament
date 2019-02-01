@@ -94,10 +94,10 @@ struct Attachments {
 };
 
 struct Descriptor {
+    Attachments attachments;
     uint32_t width = 1;             // width of resource in pixel
     uint32_t height = 1;            // height of resource in pixel
     uint8_t samples = 1;            // # of samples
-    Attachments attachments;
 };
 
 } // namespace FrameGraphRenderTarget
