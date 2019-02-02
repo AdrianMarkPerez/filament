@@ -94,7 +94,6 @@ struct Resource final : public VirtualResource { // 72
     PassNode* last = nullptr;               // pass that can destroy the resource
     uint32_t refs = 0;                      // final reference count
 
-    uint16_t renderTargetIndex = 0;
     Handle<HwTexture> texture;
 };
 
@@ -143,7 +142,6 @@ struct RenderTarget final : public VirtualResource { // 96
 
     void create(FrameGraph& fg, DriverApi& driver) noexcept override {
         const auto& resourceNodes = fg.mResourceNodes;
-        auto& renderTargets = fg.mRenderTargets;
         uint32_t width = 0;
         uint32_t height = 0;
         TextureFormat colorFormat = {};
@@ -151,7 +149,6 @@ struct RenderTarget final : public VirtualResource { // 96
         if (!imported) {
             uint32_t attachments = 0;
             Handle<HwTexture> textures[FrameGraphRenderTarget::Attachments::COUNT];
-            fg::RenderTarget* importedRenderTarget = nullptr;
 
             static constexpr TargetBufferFlags flags[] = {
                     TargetBufferFlags::COLOR,
@@ -163,48 +160,30 @@ struct RenderTarget final : public VirtualResource { // 96
                 if (attachment.isValid()) {
                     Resource const* const pResource = resourceNodes[attachment.index].resource;
                     assert(pResource);
-                    if (pResource->type == Resource::IMPORTED_RENDER_TARGET) {
-                        importedRenderTarget = &renderTargets[pResource->renderTargetIndex];
-                        break;
-                    } else {
-                        width = pResource->desc.width;
-                        height = pResource->desc.height;
-                        textures[index] = pResource->texture;
-                        attachments |= flags[index];
-                        if (index == FrameGraphRenderTarget::Attachments::COLOR) {
-                            colorFormat = pResource->desc.format;
-                        }
+                    assert(pResource->type != Resource::IMPORTED_RENDER_TARGET);
+
+                    width = pResource->desc.width;
+                    height = pResource->desc.height;
+                    textures[index] = pResource->texture;
+                    attachments |= flags[index];
+                    if (index == FrameGraphRenderTarget::Attachments::COLOR) {
+                        colorFormat = pResource->desc.format;
                     }
                 }
             }
 
-            if (importedRenderTarget) {
-                // this rendertarget is created from an imported resource
-                assert(!attachments);
-                assert(importedRenderTarget->imported);
-                imported = true;
-
-                // do not copy the "attachments"
-                desc.width = importedRenderTarget->desc.width;
-                desc.height = importedRenderTarget->desc.height;
-                desc.samples = importedRenderTarget->desc.samples;
-
-                targetInfo.target = importedRenderTarget->targetInfo.target;
-                width = desc.width;
-                height = desc.height;
-            } else if (attachments) {
+            if (attachments) {
                 targetInfo.target = driver.createRenderTarget(TargetBufferFlags(attachments),
                         width, height, desc.samples, colorFormat,
                         { textures[0] }, { textures[1] }, {});
             }
+            targetInfo.params = {};
+            targetInfo.params.clear = userTargetFlags.clear;
+            targetInfo.params.left = 0;
+            targetInfo.params.bottom = 0;
+            targetInfo.params.width = width;
+            targetInfo.params.height = height;
         }
-
-        targetInfo.params = {};
-        targetInfo.params.clear = userTargetFlags.clear;
-        targetInfo.params.left = 0;
-        targetInfo.params.bottom = 0;
-        targetInfo.params.width = width;
-        targetInfo.params.height = height;
     }
 
     void destroy(FrameGraph&, DriverApi& driver) noexcept override {
@@ -507,7 +486,15 @@ FrameGraphPassResources::getRenderTarget(FrameGraphResource r) const noexcept {
     auto const& renderTargets = fg.mRenderTargets;
     Resource const* const pResource = resourceNodes[r.index].resource;
     FrameGraphPassResources::RenderTargetInfo const* info = nullptr;
+
     // find a rendertarget in this pass that has this resource has attachment
+    // FIXME: we're looking in the whole RT list, not just for this pass -- is this correct?
+    // FIXME: it's probably not because we're matching the target with a single resource, so
+    // FIXME: so we could get some other RT that has nothing to do with this pass
+    // FIXME:
+    // FIXME: the limitation we had was that within a pass a single resource can identify
+    // FIXME: the desired RT.
+
     for (FrameGraph::UniquePtr<RenderTarget> const& renderTarget : renderTargets) {
         auto pos = std::find_if(
                 std::begin(renderTarget->desc.attachments.textures),
@@ -644,25 +631,30 @@ FrameGraphResource FrameGraph::importResource(const char* name,
         uint32_t width, uint32_t height,
         TargetBufferFlags discardStart, TargetBufferFlags discardEnd) {
 
+    // TODO: don't create a new one if it already exists
+
     // Importing a render target is a bit involved. We first create the render target as well
     // as a frame graph resource. The frame graph resource references the render target for
     // later use.
 
+    // create the resource that will be returned to the user
+    FrameGraphResource::Descriptor desc{ .width = width, .height = height };
+    ResourceNode& node = createResource(name, desc, true);
+    node.resource->type = Resource::Type::IMPORTED_RENDER_TARGET;
+    node.resource->version = node.version;
+    const FrameGraphResource r{ uint16_t(&node - mResourceNodes.data()) };
+
+    // associate this "dummy" resource to the rendertarget
+    descriptor.attachments.textures[0] = r;
+
+    // create the render target
     RenderTarget& renderTarget = createRenderTarget(name, descriptor, true);
     renderTarget.userTargetFlags.discardStart = discardStart;
     renderTarget.userTargetFlags.discardEnd = discardEnd;
     renderTarget.targetInfo.target = target;
-
-    // create the resource that will be returned to the user
-    FrameGraphResource::Descriptor desc {
-        .width = descriptor.width,
-        .height = descriptor.height,
-    };
-    ResourceNode& node = createResource(name, desc, true);
-    node.resource->type = Resource::Type::IMPORTED_RENDER_TARGET;
-    node.resource->renderTargetIndex = renderTarget.index;
-    node.resource->version = node.version;
-    return { uint16_t(&node - mResourceNodes.data()) };
+    renderTarget.targetInfo.params.width = desc.width;
+    renderTarget.targetInfo.params.height = desc.height;
+    return r;
 }
 
 FrameGraphResource FrameGraph::importResource(
@@ -739,6 +731,18 @@ FrameGraph& FrameGraph::compile() noexcept {
             ResourceNode& from = resourceNodes[alias.from.index];
             ResourceNode& to   = resourceNodes[alias.to.index];
 
+            // we need to find references to RT that where associated to "from" and remplace
+            // them by RT associated to "to".
+            // FIXME: this cannot be done in all cases, when a resource is associated with several RT
+
+            RenderTarget* fromRt = nullptr;
+            for (UniquePtr<RenderTarget> const& rt : renderTargets) {
+                if (resourceNodes[rt->desc.attachments.textures[0].index].resource == from.resource) {
+                    fromRt = rt.get();
+                }
+            }
+
+
             // remap "to" resources to "from" resources
             for (ResourceNode& cur : resourceNodes) {
                 if (cur.resource == to.resource) {
@@ -761,6 +765,17 @@ FrameGraph& FrameGraph::compile() noexcept {
                         std::remove_if(pass.writes.begin(), pass.writes.end(),
                                 [&alias](auto handle) { return handle.index == alias.from.index; }),
                         pass.writes.end());
+
+
+                // find passes using a RT using "to"
+                if (fromRt) {
+                    for (auto& rtInfo : pass.targetFlags) {
+                        RenderTarget const* rt = rtInfo.first;
+                        if (resourceNodes[rt->desc.attachments.textures[0].index].resource == to.resource) {
+                            rtInfo.first = fromRt;
+                        }
+                    }
+                }
             }
         }
 
