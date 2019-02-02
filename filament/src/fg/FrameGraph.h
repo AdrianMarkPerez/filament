@@ -207,7 +207,7 @@ private:
     Vector<fg::PassNode> mPassNodes;                    // list of frame graph passes
     Vector<fg::ResourceNode> mResourceNodes;            // list of resource nodes
     Vector<UniquePtr<fg::Resource>> mResourceRegistry;  // list actual resources
-    Vector<fg::RenderTarget> mRenderTargets;
+    Vector<UniquePtr<fg::RenderTarget>> mRenderTargets;
     Vector<fg::Alias> mAliases;
     uint16_t mId = 0;
 };

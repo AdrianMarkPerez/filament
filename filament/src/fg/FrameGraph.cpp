@@ -144,8 +144,8 @@ struct RenderTarget final : public VirtualResource { // 96
     void create(FrameGraph& fg, DriverApi& driver) noexcept override {
         const auto& resourceNodes = fg.mResourceNodes;
         auto& renderTargets = fg.mRenderTargets;
-        uint32_t width = desc.width;
-        uint32_t height = desc.height;
+        uint32_t width = 0;
+        uint32_t height = 0;
         TextureFormat colorFormat = {};
 
         if (!imported) {
@@ -227,7 +227,6 @@ struct PassNode { // 232
             : name(name), id(id), base(base, fg),
               reads(fg.getArena()),
               writes(fg.getArena()),
-              renderTargets(fg.getArena()),
               targetFlags(fg.getArena()),
               devirtualize(fg.getArena()),
               destroy(fg.getArena()) {
@@ -240,7 +239,7 @@ struct PassNode { // 232
 
     // for Builder
     void declareRenderTarget(RenderTarget& renderTarget) noexcept {
-        renderTargets.push_back(renderTarget.index);
+        targetFlags.push_back({&renderTarget, {}});
     }
 
     FrameGraphResource read(FrameGraph& fg, FrameGraphResource const& handle, bool isRenderTarget = false) {
@@ -332,8 +331,7 @@ struct PassNode { // 232
     // set by the builder
     Vector<FrameGraphResource> reads;               // resources we're reading from
     Vector<FrameGraphResource> writes;              // resources we're writing to
-    Vector<uint16_t> renderTargets;                 // declared render targets
-    Vector<TargetFlags> targetFlags;
+    Vector<std::pair<RenderTarget*, TargetFlags>> targetFlags;
 
     // computed during compile()
     Vector<VirtualResource*> devirtualize;         // resources we need to create before executing
@@ -407,27 +405,27 @@ FrameGraph::Builder::Attachments FrameGraph::Builder::useRenderTarget(const char
         FrameGraphRenderTarget::Descriptor const& desc, TargetBufferFlags clearFlags) noexcept {
     Attachments rt{};
     FrameGraph& fg = mFrameGraph;
-    Vector<RenderTarget>& renderTargets = fg.mRenderTargets;
+    Vector<UniquePtr<RenderTarget>>& renderTargets = fg.mRenderTargets;
     Vector<ResourceNode> const& resourceNodes = fg.mResourceNodes;
 
     // find a matching rendertarget
     auto pos = std::find_if(renderTargets.begin(), renderTargets.end(),
-            [&resourceNodes, &desc](RenderTarget const& rt) {
+            [&resourceNodes, &desc](UniquePtr<RenderTarget> const& rt) {
                 // we match RT based on their attachment list and sample count
                 return std::equal(
-                        std::begin(rt.desc.attachments.textures),
-                        std::end(rt.desc.attachments.textures),
+                        std::begin(rt->desc.attachments.textures),
+                        std::end(rt->desc.attachments.textures),
                         std::begin(desc.attachments.textures),
                         std::end(desc.attachments.textures),
                         [&resourceNodes](FrameGraphResource lhs, FrameGraphResource rhs) {
                             return (lhs.index == rhs.index) || (
                                     resourceNodes[lhs.index].resource
                                     == resourceNodes[rhs.index].resource);
-                        }) && desc.samples == rt.desc.samples;
+                        }) && desc.samples == rt->desc.samples;
             });
 
     RenderTarget& renderTarget = (pos != renderTargets.end()) ?
-                                 *pos : fg.createRenderTarget(name, desc, false);
+                                 **pos : fg.createRenderTarget(name, desc, false);
 
     renderTarget.userTargetFlags.clear |= clearFlags;
 
@@ -442,10 +440,12 @@ FrameGraph::Builder::Attachments FrameGraph::Builder::useRenderTarget(const char
     for (FrameGraphResource const& attachment : desc.attachments.textures) {
         const size_t index = &attachment - desc.attachments.textures;
         if (attachment.isValid()) {
+
             ResourceNode* r = fg.getResource(attachment);
             uint8_t usage = r->resource->usage;
             usage |= usages[index];
             r->resource->usage = TextureUsage(usage);
+
             rt.textures[index] = mPass.useRenderTarget(fg, attachment);
         }
     }
@@ -459,10 +459,8 @@ FrameGraph::Builder::Attachments FrameGraph::Builder::useRenderTarget(
     Resource* pResource = pResourceNode->resource;
     assert(pResource);
     FrameGraphRenderTarget::Descriptor desc {
-        .width = pResource->desc.width,
-        .height = pResource->desc.height,
-        .samples = 1,
-        .attachments.color = texture
+        .attachments.color = texture,
+        .samples = 1
     };
     return useRenderTarget(pResource->name, desc, clearFlags);
 }
@@ -510,17 +508,16 @@ FrameGraphPassResources::getRenderTarget(FrameGraphResource r) const noexcept {
     Resource const* const pResource = resourceNodes[r.index].resource;
     FrameGraphPassResources::RenderTargetInfo const* info = nullptr;
     // find a rendertarget in this pass that has this resource has attachment
-    for (uint16_t index : mPass.renderTargets) {
-        fg::RenderTarget const& renderTarget = renderTargets[index];
+    for (FrameGraph::UniquePtr<RenderTarget> const& renderTarget : renderTargets) {
         auto pos = std::find_if(
-                std::begin(renderTarget.desc.attachments.textures),
-                std::end(renderTarget.desc.attachments.textures),
+                std::begin(renderTarget->desc.attachments.textures),
+                std::end(renderTarget->desc.attachments.textures),
                 [pResource, &resourceNodes](FrameGraphResource const& r) {
                     return resourceNodes[r.index].resource == pResource;
                 });
-        if (pos != std::end(renderTarget.desc.attachments.textures)) {
-            assert(renderTarget.targetInfo.target);
-            info = &renderTarget.targetInfo;
+        if (pos != std::end(renderTarget->desc.attachments.textures)) {
+            assert(renderTarget->targetInfo.target);
+            info = &renderTarget->targetInfo;
             break;
         }
     }
@@ -535,6 +532,7 @@ FrameGraphPassResources::getRenderTarget(FrameGraphResource r) const noexcept {
 //        << renderTarget.targetInfo.params.discardStart << ", "
 //        << renderTarget.targetInfo.params.discardEnd << io::endl;
 
+    assert(info);
     return *info;
 }
 
@@ -601,8 +599,9 @@ fg::RenderTarget& FrameGraph::createRenderTarget(const char* name,
         FrameGraphRenderTarget::Descriptor const& desc, bool imported) noexcept {
     auto& renderTargets = mRenderTargets;
     const uint16_t id = (uint16_t)renderTargets.size();
-    renderTargets.emplace_back(name, desc, imported, id);
-    return renderTargets.back();
+    RenderTarget* rt = mArena.make<RenderTarget>(name, desc, imported, id);
+    renderTargets.emplace_back(rt, *this);
+    return *renderTargets.back();
 }
 
 ResourceNode& FrameGraph::createResource(const char* name,
@@ -641,7 +640,8 @@ FrameGraphResource::Descriptor* FrameGraph::getDescriptor(FrameGraphResource r) 
 }
 
 FrameGraphResource FrameGraph::importResource(const char* name,
-        FrameGraphRenderTarget::Descriptor const& descriptor, Handle<HwRenderTarget> target,
+        FrameGraphRenderTarget::Descriptor descriptor, Handle<HwRenderTarget> target,
+        uint32_t width, uint32_t height,
         TargetBufferFlags discardStart, TargetBufferFlags discardEnd) {
 
     // Importing a render target is a bit involved. We first create the render target as well
@@ -675,8 +675,7 @@ FrameGraphResource FrameGraph::importResource(
 }
 
 uint8_t FrameGraph::computeDiscardFlags(DiscardPhase phase,
-                                        PassNode const* curr, PassNode const* first,
-                                        RenderTarget const& renderTarget) {
+        PassNode const* curr, PassNode const* first, RenderTarget const& renderTarget) {
     auto& resourceNodes = mResourceNodes;
     uint8_t discardFlags = TargetBufferFlags::ALL;
 
@@ -726,7 +725,7 @@ uint8_t FrameGraph::computeDiscardFlags(DiscardPhase phase,
 FrameGraph& FrameGraph::compile() noexcept {
     Vector<fg::PassNode>& passNodes = mPassNodes;
     Vector<fg::ResourceNode>& resourceNodes = mResourceNodes;
-    Vector<fg::RenderTarget>& renderTargets = mRenderTargets;
+    Vector<UniquePtr<fg::RenderTarget>>& renderTargets = mRenderTargets;
     Vector<UniquePtr<fg::Resource>>& resourceRegistry = mResourceRegistry;
 
     /*
@@ -854,17 +853,17 @@ FrameGraph& FrameGraph::compile() noexcept {
             // figure out which is the last pass to need this resource
             pResource->last = &pass;
         }
-        for (uint16_t rtIndex : pass.renderTargets) {
-            RenderTarget& renderTarget = renderTargets[rtIndex];
+        for (auto const& rtInfo : pass.targetFlags) {
+            RenderTarget* pRenderTarget = rtInfo.first;
             // figure out which is the first pass to need this rendertarget
-            renderTarget.first = renderTarget.first ? renderTarget.first : &pass;
+            pRenderTarget->first = pRenderTarget->first ? pRenderTarget->first : &pass;
             // figure out which is the last pass to need this rendertarget
-            renderTarget.last = &pass;
+            pRenderTarget->last = &pass;
         }
 
-        pass.targetFlags.resize(pass.renderTargets.size());
-        for (size_t i = 0, c = pass.renderTargets.size(); i < c; ++i) {
-            RenderTarget const& renderTarget = renderTargets[pass.renderTargets[i]];
+        pass.targetFlags.resize(pass.targetFlags.size());
+        for (size_t i = 0, c = pass.targetFlags.size(); i < c; ++i) {
+            RenderTarget const& renderTarget = *pass.targetFlags[i].first;
             // compute this resource discard flag for this pass for this resource
 
             // does anyone writes to this resource before us -- if so, don't discard those buffers on enter
@@ -877,7 +876,7 @@ FrameGraph& FrameGraph::compile() noexcept {
             uint8_t discardEnd = computeDiscardFlags(
                     DiscardPhase::END, &pass + 1, last, renderTarget);
 
-            TargetFlags& targetFlags = pass.targetFlags[i];
+            TargetFlags& targetFlags = pass.targetFlags[i].second;
             targetFlags.clear = 0; // this is eventually set by the user
             targetFlags.discardStart = discardStart;
             targetFlags.discardEnd = discardEnd;
@@ -897,11 +896,11 @@ FrameGraph& FrameGraph::compile() noexcept {
     }
 
     // *THEN* add the virtual rendertargets
-    for (RenderTarget& rt : renderTargets) {
-        assert(!rt.first == !rt.last);
-        if (rt.first && rt.last) {
-            rt.first->devirtualize.push_back(&rt);
-            rt.last->destroy.push_back(&rt);
+    for (UniquePtr<RenderTarget>& rt : renderTargets) {
+        assert(!rt->first == !rt->last);
+        if (rt->first && rt->last) {
+            rt->first->devirtualize.push_back(rt.get());
+            rt->last->destroy.push_back(rt.get());
         }
     }
 
@@ -909,7 +908,6 @@ FrameGraph& FrameGraph::compile() noexcept {
 }
 
 void FrameGraph::execute(DriverApi& driver) noexcept {
-    Vector<RenderTarget>& renderTargets = mRenderTargets;
     for (PassNode const& node : mPassNodes) {
         if (!node.refCount) continue;
         assert(node.base);
@@ -920,9 +918,9 @@ void FrameGraph::execute(DriverApi& driver) noexcept {
         }
 
         // populate the discard flags from each render target used by this pass
-        for (size_t i = 0, c = node.renderTargets.size(); i < c; ++i) {
-            TargetFlags flags = node.targetFlags[i];
-            RenderPassParams& params = renderTargets[node.renderTargets[i]].targetInfo.params;
+        for (const auto& targetFlag : node.targetFlags) {
+            TargetFlags flags = targetFlag.second;
+            RenderPassParams& params = targetFlag.first->targetInfo.params;
             params.discardStart = flags.discardStart;
             params.discardEnd = flags.discardEnd;
             params.dependencies = flags.dependencies;
